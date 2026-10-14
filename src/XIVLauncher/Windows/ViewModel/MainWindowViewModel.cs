@@ -255,8 +255,11 @@ namespace XIVLauncher.Windows.ViewModel
                     Loc.Localize("EmptyPasswordError", "Please enter a password."),
                     "XIVLauncher", MessageBoxButton.OK, MessageBoxImage.Error, parentWindow: _window);
 
-                App.Settings.AutologinEnabled = false;
-                IsAutoLogin = false;
+                if (!(App.GlobalIsCanaryAccountAutologin && doingAutoLogin))
+                {
+                    App.Settings.AutologinEnabled = false;
+                    IsAutoLogin = false;
+                }
                 return;
             }
 
@@ -279,6 +282,12 @@ namespace XIVLauncher.Windows.ViewModel
 
             if (isOtp && (!hasValidCache || action == AfterLoginAction.Repair))
             {
+                if (App.GlobalIsCanaryAccountAutologin && doingAutoLogin)
+                {
+                    Log.Warning("Guarded canary account login stopped because manual OTP authentication is required.");
+                    return;
+                }
+
                 otp = OtpInputDialog.AskForOtp((otpDialog, result) =>
                 {
                     if (AccountManager.CurrentAccount != null && result != null && AccountManager.CurrentAccount.LastSuccessfulOtp == result)
@@ -292,7 +301,8 @@ namespace XIVLauncher.Windows.ViewModel
             if (otp == null)
                 return;
 
-            PersistAccount(username, password);
+            if (!(App.GlobalIsCanaryAccountAutologin && doingAutoLogin))
+                PersistAccount(username, password);
 
             if (!doingAutoLogin) App.Settings.AutologinEnabled = IsAutoLogin;
 
@@ -300,7 +310,7 @@ namespace XIVLauncher.Windows.ViewModel
             if (loginResult == null)
                 return;
 
-            if (otp != null)
+            if (otp != null && !(App.GlobalIsCanaryAccountAutologin && doingAutoLogin))
                 AccountManager.UpdateLastSuccessfulOtp(AccountManager.CurrentAccount, otp);
 
             Log.Verbose("[LR] {State} {NumPatches} {Playable}",
@@ -559,7 +569,7 @@ namespace XIVLauncher.Windows.ViewModel
                               "Please check your login information or try again."));
                 }
 
-                if (disableAutoLogin && App.Settings.AutologinEnabled)
+                if (disableAutoLogin && App.Settings.AutologinEnabled && !App.GlobalIsCanaryAccountAutologin)
                 {
                     msgbox.WithAppendText(Loc.Localize("LoginNoOauthAutologinHint", "\n\nAuto-Login has been disabled."));
                     App.Settings.AutologinEnabled = false;

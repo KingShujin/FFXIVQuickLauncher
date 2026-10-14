@@ -386,7 +386,7 @@ namespace XIVLauncher.Windows
                 }
 
                 // When this happens we probably don't want them to run into it again, in case it's an issue with a moved game for example
-                if (App.Settings != null)
+                if (App.Settings != null && !App.GlobalIsCanaryAccountAutologin)
                     App.Settings.AutologinEnabled = false;
 
                 return builder;

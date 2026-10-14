@@ -283,13 +283,46 @@ namespace XIVLauncher.Windows
                 Console.Beep(523, 150); // Feedback without popup
             }
 
-            if (App.GlobalIsDisableAutologin)
+            if (App.GlobalIsDisableAutologin && !App.GlobalIsCanaryAccountAutologin)
             {
                 Log.Information("Autologin was disabled globally, saving into settings...");
                 App.Settings.AutologinEnabled = false;
             }
 
-            if (App.Settings.AutologinEnabled && savedAccount != null && !Keyboard.Modifiers.HasFlag(ModifierKeys.Shift))
+            if (App.GlobalIsCanaryAccountAutologin)
+            {
+                if (Keyboard.Modifiers.HasFlag(ModifierKeys.Shift) ||
+                    bool.TryParse(Environment.GetEnvironmentVariable("XL_NOAUTOLOGIN"), out var manualLogin) && manualLogin)
+                    Log.Information("Guarded canary account login was skipped by a manual-login override.");
+                else if (savedAccount == null || !savedAccount.SavePassword)
+                    Log.Warning("Guarded canary account login needs a selected saved account.");
+                else if (savedAccount.UseOtp &&
+                         (!App.Settings.UniqueIdCacheEnabled || !App.UniqueIdCache.HasValidCache(savedAccount.UserName)))
+                    Log.Warning("Guarded canary account login needs manual OTP authentication.");
+                else if (!savedAccount.UseOtp && !App.Settings.HasComplainedAboutNoOtp.GetValueOrDefault(false))
+                    Log.Warning("Guarded canary account login needs manual acknowledgement of the OTP warning.");
+                else
+                {
+                    try
+                    {
+                        var password = savedAccount.Password;
+                        if (!string.IsNullOrWhiteSpace(password))
+                        {
+                            Log.Information("Engaging guarded canary account login.");
+                            Model.TryLogin(savedAccount.UserName, password, savedAccount.UseOtp,
+                                savedAccount.UseSteamServiceAccount, true, MainWindowViewModel.AfterLoginAction.Start);
+                            return;
+                        }
+
+                        Log.Warning("Guarded canary account login has no saved password.");
+                    }
+                    catch (Win32Exception)
+                    {
+                        Log.Warning("Guarded canary account login could not access the saved credential.");
+                    }
+                }
+            }
+            else if (App.Settings.AutologinEnabled && savedAccount != null && !Keyboard.Modifiers.HasFlag(ModifierKeys.Shift))
             {
                 Log.Information("Engaging Autologin...");
                 Model.TryLogin(savedAccount.UserName, savedAccount.Password,

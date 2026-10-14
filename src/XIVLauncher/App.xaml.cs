@@ -13,6 +13,7 @@ using CheapLoc;
 using CommandLine;
 using Config.Net;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using Serilog;
 using XIVLauncher.Common;
 using XIVLauncher.Common.Dalamud;
@@ -49,6 +50,9 @@ namespace XIVLauncher
 
             [CommandLine.Option("noautologin", Required = false, HelpText = "Disable autologin.")]
             public bool NoAutoLogin { get; set; }
+
+            [CommandLine.Option("canary-account-autologin", Required = false, HelpText = "Use the selected saved account for a guarded XIV Enhanced canary only.")]
+            public bool CanaryAccountAutologin { get; set; }
 
             [CommandLine.Option("gen-localizable", Required = false, HelpText = "Generate localizable files.")]
             public bool DoGenerateLocalizables { get; set; }
@@ -101,6 +105,7 @@ namespace XIVLauncher
         private MainWindow mainWindow;
 
         public static bool GlobalIsDisableAutologin { get; private set; }
+        public static bool GlobalIsCanaryAccountAutologin { get; private set; }
         public static byte[] GlobalSteamTicket { get; private set; }
         public static DalamudUpdater DalamudUpdater { get; private set; }
 
@@ -300,6 +305,92 @@ namespace XIVLauncher
 
         private static string GetConfigPath(string prefix) => Path.Combine(Paths.RoamingPath, $"{prefix}ConfigV3.json");
 
+        private static bool IsGuardedCanaryAccountLogin(CmdLineOptions options)
+        {
+            if (!options.NoAutoLogin || string.IsNullOrWhiteSpace(options.RoamingPath) ||
+                string.IsNullOrWhiteSpace(options.DalamudRunnerOverride) ||
+                !Guid.TryParseExact(Environment.GetEnvironmentVariable("XIVENHANCED_CANARY_SESSION"), "N", out var session))
+                return false;
+
+            var fingerprint = Environment.GetEnvironmentVariable("XIVENHANCED_CANARY_FINGERPRINT");
+            if (fingerprint?.Length != 64 || !fingerprint.All(Uri.IsHexDigit) ||
+                !string.Equals(fingerprint, fingerprint.ToUpperInvariant(), StringComparison.Ordinal))
+                return false;
+
+            try
+            {
+                var profile = Path.GetFullPath(options.RoamingPath).TrimEnd(Path.DirectorySeparatorChar);
+                var expectedProfile = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "profile"));
+                if (!string.Equals(profile, expectedProfile, StringComparison.OrdinalIgnoreCase) ||
+                    !IsOrdinaryCanaryDirectory(AppContext.BaseDirectory) ||
+                    !IsOrdinaryCanaryDirectory(profile))
+                    return false;
+
+                var certification = Path.Combine(profile, "patch-certification");
+                var runners = Path.Combine(certification, "runners");
+                var receipts = Path.Combine(certification, "canary-runtime-receipts");
+                if (!IsOrdinaryCanaryDirectory(certification) ||
+                    !IsOrdinaryCanaryDirectory(runners) ||
+                    !IsOrdinaryCanaryDirectory(receipts))
+                    return false;
+                var runnerRoot = runners + Path.DirectorySeparatorChar;
+                var injector = Path.GetFullPath(options.DalamudRunnerOverride);
+                if (!injector.StartsWith(runnerRoot, StringComparison.OrdinalIgnoreCase) ||
+                    !Path.GetFileName(injector).Equals("Dalamud.Injector.exe", StringComparison.OrdinalIgnoreCase))
+                    return false;
+
+                var runner = Path.GetDirectoryName(injector);
+                if (!IsOrdinaryCanaryDirectory(runner))
+                    return false;
+                var pending = ReadBoundedCanaryRecord(Path.Combine(certification, "pending-update.json"));
+                var receipt = ReadBoundedCanaryRecord(Path.Combine(receipts, session.ToString("N") + ".json"));
+                if (pending == null || receipt == null ||
+                    (int?)pending["schemaVersion"] != 1 ||
+                    (string)pending["evidenceType"] != "xiv-enhanced-pending-patch-certification" ||
+                    (string)pending["candidateFingerprint"] != fingerprint ||
+                    !string.Equals(Path.GetFullPath((string)pending["runner"] ?? ""), runner, StringComparison.OrdinalIgnoreCase) ||
+                    (int?)receipt["schemaVersion"] != 1 ||
+                    (string)receipt["evidenceType"] != "xiv-enhanced-canary-runtime-observation" ||
+                    (string)receipt["status"] != "awaiting-process" ||
+                    (string)receipt["sessionId"] != session.ToString("N") ||
+                    (string)receipt["candidateFingerprint"] != fingerprint ||
+                    (string)receipt["gameVersion"] != (string)pending["gameVersion"] ||
+                    receipt["processId"]?.Type != JTokenType.Null ||
+                    !string.Equals(Path.GetFullPath((string)receipt["expectedDalamudPath"] ?? ""),
+                        Path.Combine(runner, "Dalamud.dll"), StringComparison.OrdinalIgnoreCase) ||
+                    (string)receipt["expectedDalamudSha256"] != (string)pending["runnerDllSha256"])
+                    return false;
+
+                var requestedAt = (DateTimeOffset?)receipt["launchRequestedAtUtc"];
+                var readyAt = (DateTimeOffset?)receipt["observerReadyAtUtc"];
+                var discoveryDeadline = (DateTimeOffset?)receipt["processDiscoveryDeadlineUtc"];
+                var now = DateTimeOffset.UtcNow;
+                return requestedAt.HasValue && readyAt.HasValue && discoveryDeadline.HasValue &&
+                       requestedAt.Value <= readyAt.Value && readyAt.Value <= now &&
+                       now - requestedAt.Value <= TimeSpan.FromMinutes(10) && discoveryDeadline.Value > now;
+            }
+            catch (Exception)
+            {
+                // The opt-in has no fallback to ordinary autologin. Malformed or
+                // inaccessible candidate evidence always leaves the canary closed.
+                return false;
+            }
+        }
+
+        private static JObject ReadBoundedCanaryRecord(string path)
+        {
+            var file = new FileInfo(path);
+            if (!file.Exists || file.Length > 65536 || (file.Attributes & FileAttributes.ReparsePoint) != 0)
+                return null;
+            return JObject.Parse(File.ReadAllText(path));
+        }
+
+        private static bool IsOrdinaryCanaryDirectory(string path)
+        {
+            var directory = new DirectoryInfo(path);
+            return directory.Exists && (directory.Attributes & FileAttributes.ReparsePoint) == 0;
+        }
+
         private void App_OnStartup(object sender, StartupEventArgs e)
         {
             // HW rendering commonly causes issues with material design, so we turn it off by default for now
@@ -343,6 +434,18 @@ namespace XIVLauncher
                 if (CommandLine.NoAutoLogin)
                 {
                     GlobalIsDisableAutologin = true;
+                }
+
+                if (CommandLine.CanaryAccountAutologin)
+                {
+                    if (!IsGuardedCanaryAccountLogin(CommandLine))
+                    {
+                        Log.Error("Canary account login refused: guarded canary launch context is missing.");
+                        Shutdown(-1);
+                        return;
+                    }
+
+                    GlobalIsCanaryAccountAutologin = true;
                 }
 
                 if (!string.IsNullOrEmpty(CommandLine.DoGenerateIntegrity))
